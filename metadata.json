@@ -1,0 +1,6 @@
+{
+  "name": "Anime Orchestrator",
+  "description": "AI-assisted production workspace for developing consistent anime characters, worlds, storyboards, and videos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
