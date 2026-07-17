@@ -8,7 +8,6 @@ interface Props {
 }
 
 export default function SettingsTab({ activeProject, onUpdateBudget }: Props) {
-  const [geminiKey, setGeminiKey] = useState('●●●●●●●●●●●●●●●●●●●●');
   const [budgetLimit, setBudgetLimit] = useState(activeProject ? activeProject.budgetLimit : 50.00);
 
   // Model abstraction setup
@@ -23,7 +22,7 @@ export default function SettingsTab({ activeProject, onUpdateBudget }: Props) {
 
   return (
     <div className="space-y-6" id="settings-tab">
-      <div className="flex justify-between items-center border-b border-studio-border pb-4">
+      <div className="flex flex-col gap-4 border-b border-studio-border pb-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-display font-bold text-white flex items-center gap-2">
             <Settings size={22} className="text-studio-muted" /> Studio Configuration & Adapters
@@ -47,15 +46,12 @@ export default function SettingsTab({ activeProject, onUpdateBudget }: Props) {
 
           <div className="space-y-4">
             <div>
-              <label className="block text-[10px] font-semibold text-studio-muted uppercase tracking-wider mb-2">Gemini API Key</label>
-              <input
-                type="password"
-                value={geminiKey}
-                onChange={(e) => setGeminiKey(e.target.value)}
-                className="w-full bg-studio-dark border border-studio-border rounded px-3 py-2 text-xs text-white focus:outline-none"
-              />
+              <span className="mb-2 block text-[10px] font-semibold uppercase tracking-wider text-studio-muted">Gemini API Key</span>
+              <div className="rounded border border-studio-border bg-studio-dark px-3 py-2 text-xs font-semibold text-emerald-300">
+                Server-managed environment credential
+              </div>
               <p className="text-[10px] text-studio-muted mt-1 leading-relaxed">
-                Managed securely in the server environment. This key is never exposed to public frontend scopes.
+                Configure <code>GEMINI_API_KEY</code> on the server. Secret values cannot be entered, read, or recovered in the browser.
               </p>
             </div>
 

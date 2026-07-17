@@ -1,7 +1,18 @@
+import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import path from 'path';
+import cors from 'cors';
+import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
-import { db } from './server/db';
+import { db, DBStructure } from './server/db';
+import {
+  createIntegrationRouter,
+  legacyReadGuard,
+  legacyWriteGuard,
+  requireIntegrationAdmin,
+} from './server/integrations/routes';
+import { createMcpRouter } from './server/mcp/http';
 import { 
   extractStoryBibleFields, 
   runCharacterInterview, 
@@ -12,14 +23,118 @@ import {
 } from './server/gemini';
 import { Project, StoryBible, Character, Location, Prop, Scene, StoryboardPanel, ShotBuilder } from './src/types';
 
-const app = express();
-const PORT = 3000;
+export const app = express();
+const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || (
+  process.env.NODE_ENV !== 'production' && process.env.ALLOW_INSECURE_LOCAL_API === 'true'
+    ? '127.0.0.1'
+    : '0.0.0.0'
+);
+const TRUST_PROXY_HOPS = Math.max(0, Number.parseInt(process.env.TRUST_PROXY_HOPS || '0', 10) || 0);
+
+if (TRUST_PROXY_HOPS > 0) app.set('trust proxy', TRUST_PROXY_HOPS);
+
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: [
+        "'self'",
+        ...(process.env.NODE_ENV === 'production' ? [] : ["'unsafe-inline'", "'unsafe-eval'"]),
+      ],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      mediaSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      connectSrc: ["'self'", ...(process.env.NODE_ENV === 'production' ? [] : ['ws:', 'wss:'])],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      frameAncestors: ["'self'"],
+    },
+  },
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
+
+const allowedOrigins = new Set(
+  [
+    process.env.PUBLIC_BASE_URL,
+    ...(process.env.ALLOWED_ORIGINS || '').split(','),
+    `http://localhost:${PORT}`,
+    `http://127.0.0.1:${PORT}`
+  ]
+    .map(value => value?.trim())
+    .filter((value): value is string => Boolean(value))
+    .map(value => value.replace(/\/$/, ''))
+);
+
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin.replace(/\/$/, ''))) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error('Origin is not allowed.'));
+  }
+}));
+
+app.use((req, res, next) => {
+  const requestId = req.header('x-request-id')?.slice(0, 128) || randomUUID();
+  res.setHeader('x-request-id', requestId);
+  res.locals.requestId = requestId;
+  next();
+});
+
+app.use('/mcp', createMcpRouter());
 
 app.use(express.json({ limit: '10mb' }));
+
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, service: 'anime-orchestrator', version: '0.1.0' });
+});
+
+app.use('/api/integrations', createIntegrationRouter());
+app.use('/api/export', requireIntegrationAdmin);
+app.use('/api/codex/logs', requireIntegrationAdmin);
+app.use('/api', legacyReadGuard);
+app.use('/api', legacyWriteGuard);
 
 // Audit log helper
 function logAudit(endpoint: string, action: string, result: string, payload: any) {
   db.addAuditLog(endpoint, action, result, JSON.stringify(payload));
+}
+
+function validateImportDatabase(value: unknown): DBStructure {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Import data must be a database object.');
+  }
+  const record = value as Record<string, unknown>;
+  const requiredArrays: Array<keyof DBStructure> = [
+    'projects', 'bibles', 'characters', 'costumes', 'locations', 'props', 'scenes',
+    'storyboardPanels', 'shotBuilders', 'videoClips', 'timelines', 'assets',
+    'continuityResults', 'auditLogs',
+  ];
+  for (const key of requiredArrays) {
+    if (!Array.isArray(record[key])) throw new Error(`Import field ${key} must be an array.`);
+  }
+  const assertUniqueIds = (key: keyof DBStructure) => {
+    const seen = new Set<string>();
+    for (const item of record[key] as Array<Record<string, unknown>>) {
+      if (!item || typeof item !== 'object' || typeof item.id !== 'string' || !item.id.trim()) {
+        throw new Error(`Every ${key} record must have a non-empty immutable ID.`);
+      }
+      if (seen.has(item.id)) throw new Error(`Duplicate ${key} ID: ${item.id}`);
+      seen.add(item.id);
+    }
+  };
+  for (const key of [
+    'projects', 'characters', 'costumes', 'locations', 'props', 'scenes',
+    'storyboardPanels', 'shotBuilders', 'videoClips', 'assets', 'continuityResults', 'auditLogs',
+  ] as Array<keyof DBStructure>) {
+    assertUniqueIds(key);
+  }
+  return JSON.parse(JSON.stringify(value)) as DBStructure;
 }
 
 // ==========================================
@@ -42,6 +157,7 @@ app.post('/api/projects', (req, res) => {
   if (!title) return res.status(400).json({ error: 'Title is required' });
 
   const id = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'new-project';
+  if (db.getProject(id)) return res.status(409).json({ error: 'A project with this ID already exists.' });
   const newProject: Project = {
     id,
     title,
@@ -56,7 +172,7 @@ app.post('/api/projects', (req, res) => {
 
   db.saveProject(newProject);
   logAudit('POST /api/projects', 'CREATE_PROJECT', 'Success', { id, title });
-  res.status(210).json(newProject);
+  res.status(201).json(newProject);
 });
 
 app.get('/api/projects/:id/canon', (req, res) => {
@@ -123,14 +239,29 @@ app.post('/api/projects/:id/characters', (req, res) => {
   if (!character.id) {
     character.id = 'char-' + Math.random().toString(36).substring(2, 9);
   }
+  character.isLocked = false;
+  character.canonStatus = 'Draft';
+  if (db.getCharacter(character.id)) {
+    return res.status(409).json({ error: 'A character with this immutable ID already exists.' });
+  }
   db.saveCharacter(character);
   logAudit(`POST /api/projects/${req.params.id}/characters`, 'CREATE_CHARACTER', 'Success', { id: character.id, name: character.name });
   res.json(character);
 });
 
 app.put('/api/characters/:id', (req, res) => {
-  const character = req.body as Character;
-  character.id = req.params.id;
+  const existing = db.getCharacter(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Character not found' });
+  if (existing.isLocked || existing.canonStatus === 'Canon Locked') {
+    return res.status(409).json({ error: 'Locked canon cannot be overwritten. Create a canon-change proposal.' });
+  }
+  const character: Character = {
+    ...(req.body as Character),
+    id: existing.id,
+    projectId: existing.projectId,
+    isLocked: existing.isLocked,
+    canonStatus: existing.canonStatus,
+  };
   db.saveCharacter(character);
   logAudit(`PUT /api/characters/${req.params.id}`, 'UPDATE_CHARACTER', 'Success', { id: character.id });
   res.json(character);
@@ -139,10 +270,11 @@ app.put('/api/characters/:id', (req, res) => {
 app.post('/api/characters/:id/lock', (req, res) => {
   const char = db.getCharacter(req.params.id);
   if (!char) return res.status(404).json({ error: 'Character not found' });
-  char.isLocked = !char.isLocked;
-  char.canonStatus = char.isLocked ? 'Canon Locked' : 'Approved';
+  if (char.isLocked || char.canonStatus === 'Canon Locked') return res.json(char);
+  char.isLocked = true;
+  char.canonStatus = 'Canon Locked';
   db.saveCharacter(char);
-  logAudit(`POST /api/characters/${req.params.id}/lock`, 'TOGGLE_CANON_LOCK', 'Success', { id: char.id, isLocked: char.isLocked });
+  logAudit(`POST /api/characters/${req.params.id}/lock`, 'LOCK_CANON', 'Success', { id: char.id, isLocked: char.isLocked });
   res.json(char);
 });
 
@@ -153,13 +285,16 @@ app.post('/api/characters/:id/interview', async (req, res) => {
   const { message, history } = req.body;
   try {
     const reply = await runCharacterInterview(char, history || [], message);
-    // Append to logs
-    char.interviewLog = history || [];
-    char.interviewLog.push({ speaker: 'user', text: message });
-    char.interviewLog.push({ speaker: 'character', text: reply });
-    db.saveCharacter(char);
+    const interviewLog = [...(history || [])];
+    interviewLog.push({ speaker: 'user', text: message });
+    interviewLog.push({ speaker: 'character', text: reply });
+    const canPersist = !char.isLocked && char.canonStatus !== 'Canon Locked';
+    if (canPersist) {
+      char.interviewLog = interviewLog;
+      db.saveCharacter(char);
+    }
 
-    res.json({ reply, interviewLog: char.interviewLog });
+    res.json({ reply, interviewLog, persisted: canPersist });
   } catch (e: any) {
     res.status(500).json({ error: e.message || 'Interview failed' });
   }
@@ -189,6 +324,11 @@ app.post('/api/projects/:id/locations', (req, res) => {
   const loc = req.body as Location;
   loc.projectId = req.params.id;
   if (!loc.id) loc.id = 'loc-' + Math.random().toString(36).substring(2, 9);
+  loc.isLocked = false;
+  loc.canonStatus = 'Draft';
+  if (db.getDatabaseState().locations.some(item => item.id === loc.id)) {
+    return res.status(409).json({ error: 'A location with this immutable ID already exists.' });
+  }
   db.saveLocation(loc);
   res.json(loc);
 });
@@ -201,6 +341,11 @@ app.post('/api/projects/:id/props', (req, res) => {
   const pr = req.body as Prop;
   pr.projectId = req.params.id;
   if (!pr.id) pr.id = 'prop-' + Math.random().toString(36).substring(2, 9);
+  pr.isLocked = false;
+  pr.canonStatus = 'Draft';
+  if (db.getDatabaseState().props.some(item => item.id === pr.id)) {
+    return res.status(409).json({ error: 'A prop with this immutable ID already exists.' });
+  }
   db.saveProp(pr);
   res.json(pr);
 });
@@ -217,13 +362,26 @@ app.post('/api/projects/:id/scenes', (req, res) => {
   const scene = req.body as Scene;
   scene.projectId = req.params.id;
   if (!scene.id) scene.id = 'scene-' + Math.random().toString(36).substring(2, 9);
+  scene.status = 'Draft';
+  if (db.getScene(scene.id)) {
+    return res.status(409).json({ error: 'A scene with this immutable ID already exists.' });
+  }
   db.saveScene(scene);
   res.json(scene);
 });
 
 app.put('/api/scenes/:id', (req, res) => {
-  const scene = req.body as Scene;
-  scene.id = req.params.id;
+  const existing = db.getScene(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Scene not found' });
+  if (existing.status === 'Approved' || existing.status === 'Canon Locked') {
+    return res.status(409).json({ error: 'Approved or locked scenes cannot be overwritten. Create a scene draft.' });
+  }
+  const scene: Scene = {
+    ...(req.body as Scene),
+    id: existing.id,
+    projectId: existing.projectId,
+    status: existing.status,
+  };
   db.saveScene(scene);
   res.json(scene);
 });
@@ -240,8 +398,10 @@ app.post('/api/scenes/:id/analyze', async (req, res) => {
 
   try {
     const feedback = await analyzeRoughScene(scene, locName, charProfile);
-    scene.analysisResult = feedback;
-    db.saveScene(scene);
+    if (scene.status === 'Draft') {
+      scene.analysisResult = feedback;
+      db.saveScene(scene);
+    }
     logAudit(`POST /api/scenes/${req.params.id}/analyze`, 'ANALYZE_SCENE', 'Success', { id: scene.id });
     res.json(feedback);
   } catch (e: any) {
@@ -252,6 +412,9 @@ app.post('/api/scenes/:id/analyze', async (req, res) => {
 app.post('/api/scenes/:id/storyboard/generate', async (req, res) => {
   const scene = db.getScene(req.params.id);
   if (!scene) return res.status(404).json({ error: 'Scene not found' });
+  if (db.getStoryboardPanels(scene.id).some(panel => panel.isApproved)) {
+    return res.status(409).json({ error: 'Approved storyboard panels cannot be overwritten by generation.' });
+  }
 
   const loc = db.getLocations(scene.projectId).find(l => l.id === scene.locationId);
   const locName = loc ? loc.name : 'Unknown Location';
@@ -282,6 +445,15 @@ app.get('/api/scenes/:id/storyboard', (req, res) => {
 
 app.put('/api/scenes/:id/storyboard', (req, res) => {
   const panels = req.body as StoryboardPanel[];
+  if (!Array.isArray(panels) || panels.some(panel => panel.sceneId !== req.params.id)) {
+    return res.status(400).json({ error: 'Every storyboard panel must belong to the requested scene.' });
+  }
+  const approvedIds = new Set(
+    db.getStoryboardPanels(req.params.id).filter(panel => panel.isApproved).map(panel => panel.id),
+  );
+  if (panels.some(panel => approvedIds.has(panel.id))) {
+    return res.status(409).json({ error: 'Approved storyboard panels cannot be overwritten. Create a new panel version.' });
+  }
   db.saveStoryboardPanels(panels);
   res.json(panels);
 });
@@ -314,7 +486,7 @@ app.put('/api/projects/:id/timeline', (req, res) => {
 });
 
 // ==========================================
-// 7. VIDEO GENERATION (Fast Preview & Real-Veo)
+// 7. VIDEO GENERATION (development-only legacy simulator)
 // ==========================================
 
 // Queue tracker
@@ -330,10 +502,16 @@ interface VideoJob {
 const activeJobs: Record<string, VideoJob> = {};
 
 app.post('/api/generations/video', (req, res) => {
+  if (process.env.ALLOW_SIMULATED_GENERATION !== 'true' || process.env.NODE_ENV === 'production') {
+    return res.status(503).json({
+      error:
+        'The legacy stock-video simulator is disabled. Use the reviewed generation-job workflow after a real provider worker is connected.',
+    });
+  }
   const { projectId, prompt, isFastPreview, shotId } = req.body;
   const jobId = 'job-' + Math.random().toString(36).substring(2, 9);
 
-  // We support real pipeline updates to reassure the user during compilation
+  // Simulated progress for explicit local UI testing only.
   const job: VideoJob = {
     id: jobId,
     projectId: projectId || 'crimson-sword',
@@ -360,7 +538,7 @@ app.post('/api/generations/video', (req, res) => {
       currentJob.progress = Math.min((currentStep + 1) * 25, 100);
       currentStep++;
       if (currentJob.status === 'completed') {
-        // Assign realistic anime placeholder video clips
+        // Assign stock placeholders; these are never real provider output.
         currentJob.videoUrl = isFastPreview 
           ? 'https://assets.mixkit.co/videos/preview/mixkit-foggy-green-mountains-under-the-clouds-40292-large.mp4'
           : 'https://assets.mixkit.co/videos/preview/mixkit-waterfall-in-forest-2213-large.mp4';
@@ -516,21 +694,52 @@ ${scenes.map(s => `### Scene ${s.episodeNumber}.${s.sceneNumber}: ${s.title}
 `).join('\n')}
 `;
 
+  const state = db.getDatabaseState();
+  const characterIds = new Set(characters.map(character => character.id));
+  const sceneIds = new Set(scenes.map(scene => scene.id));
   res.json({
     manifestVersion: '1.0.0',
     projectId: id,
     exportedAt: new Date().toISOString(),
-    data: db.getDatabaseState(),
+    data: {
+      projects: [project],
+      bibles: state.bibles.filter(item => item.projectId === id),
+      characters,
+      costumes: state.costumes.filter(item => characterIds.has(item.characterId)),
+      locations,
+      props,
+      scenes,
+      storyboardPanels: state.storyboardPanels.filter(item => sceneIds.has(item.sceneId)),
+      shotBuilders: state.shotBuilders.filter(item => item.projectId === id),
+      videoClips: state.videoClips.filter(item => item.projectId === id),
+      timelines: state.timelines.filter(item => item.projectId === id),
+      assets: state.assets.filter(item => item.projectId === id),
+      continuityResults: state.continuityResults.filter(item => item.projectId === id),
+      auditLogs: [],
+    },
     markdownSpecification: markdown
   });
 });
 
 app.post('/api/import', (req, res) => {
-  const { data } = req.body;
+  const { data, confirmation, lockedCanonConfirmation } = req.body;
   if (!data) return res.status(400).json({ error: 'No export data provided for import.' });
+  if (confirmation !== 'REPLACE LOCAL DATABASE') {
+    return res.status(400).json({ error: 'Type REPLACE LOCAL DATABASE to confirm this destructive import.' });
+  }
+  const state = db.getDatabaseState();
+  const hasLockedCanon =
+    state.characters.some(item => item.isLocked || item.canonStatus === 'Canon Locked') ||
+    state.locations.some(item => item.isLocked || item.canonStatus === 'Canon Locked') ||
+    state.props.some(item => item.isLocked || item.canonStatus === 'Canon Locked') ||
+    state.scenes.some(item => item.status === 'Canon Locked') ||
+    state.storyboardPanels.some(item => item.isApproved);
+  if (hasLockedCanon && lockedCanonConfirmation !== 'REPLACE LOCKED CANON') {
+    return res.status(409).json({ error: 'Type REPLACE LOCKED CANON to confirm replacement of approved or locked records.' });
+  }
 
   try {
-    db.importDatabaseState(data);
+    db.importDatabaseState(validateImportDatabase(data));
     logAudit('POST /api/import', 'IMPORT_PROJECT', 'Success', { manifest: 'db.json' });
     res.json({ success: true, message: 'Project specification successfully imported.' });
   } catch (e: any) {
@@ -538,12 +747,35 @@ app.post('/api/import', (req, res) => {
   }
 });
 
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
+app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+  const message = error instanceof Error ? error.message : '';
+  if (message === 'Origin is not allowed.') {
+    res.status(403).json({ error: 'Origin is not allowed.' });
+    return;
+  }
+  const bodyError = error as { type?: string; status?: number };
+  if (bodyError.type === 'entity.too.large' || bodyError.status === 413) {
+    res.status(413).json({ error: 'Request body is too large.' });
+    return;
+  }
+  console.error(`[${res.locals.requestId || 'no-request-id'}] Request failed.`);
+  res.status(500).json({ error: 'The request could not be completed.' });
+});
+
 
 // ==========================================
 // 11. VITE / FRONTEND SERVING
 // ==========================================
 
-async function startServer() {
+export async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -558,9 +790,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Anime Orchestrator server running on http://localhost:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Anime Orchestrator server running on http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer().catch(error => {
+    console.error('Failed to start Anime Orchestrator:', error);
+    process.exitCode = 1;
+  });
+}

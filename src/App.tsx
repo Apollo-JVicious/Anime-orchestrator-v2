@@ -291,10 +291,10 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-studio-dark text-studio-text flex font-sans" id="studio-shell">
+    <div className="min-h-screen bg-studio-dark text-studio-text flex flex-col font-sans md:flex-row" id="studio-shell">
       {/* Sidebar navigation */}
-      <aside className="w-64 bg-studio-card border-r border-studio-border flex flex-col justify-between shrink-0">
-        <div className="space-y-6 py-5">
+      <aside className="flex w-full shrink-0 flex-col justify-between border-b border-studio-border bg-studio-card md:min-h-screen md:w-64 md:border-b-0 md:border-r">
+        <div className="space-y-4 py-3 md:space-y-6 md:py-5">
           {/* Logo badge */}
           <div className="px-6 flex items-center gap-2">
             <span className="w-8 h-8 rounded bg-studio-red flex items-center justify-center font-display font-black text-white text-base">
@@ -307,7 +307,7 @@ export default function App() {
           </div>
 
           {/* Core Menu */}
-          <nav className="space-y-1 px-3">
+          <nav className="flex gap-1 overflow-x-auto px-3 pb-1 md:block md:space-y-1 md:overflow-visible md:pb-0">
             {[
               { id: 'dashboard', label: 'Production Cockpit', icon: <Layers size={14} /> },
               { id: 'bible', label: 'Story Bible', icon: <BookOpen size={14} />, requiresProject: true },
@@ -330,7 +330,7 @@ export default function App() {
                   key={item.id}
                   disabled={isDisabled}
                   onClick={() => setCurrentTab(item.id)}
-                  className={`w-full flex items-center gap-3 px-4 py-2 text-xs font-semibold uppercase tracking-wider rounded transition-all text-left cursor-pointer ${
+                  className={`flex w-auto shrink-0 items-center gap-3 rounded px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider transition-all cursor-pointer md:w-full ${
                     isActive 
                       ? 'bg-studio-red/10 text-studio-red border-l-2 border-studio-red' 
                       : isDisabled 
@@ -347,7 +347,7 @@ export default function App() {
 
         {/* Bottom hud */}
         {activeProject && (
-          <div className="p-4 border-t border-studio-border bg-studio-dark/35 space-y-2">
+          <div className="hidden space-y-2 border-t border-studio-border bg-studio-dark/35 p-4 md:block">
             <span className="text-[10px] text-studio-muted uppercase tracking-widest block font-bold font-mono">Current Channel</span>
             <div className="flex items-center justify-between text-xs font-semibold text-white">
               <span className="truncate max-w-[120px]">{activeProject.title}</span>
@@ -358,7 +358,7 @@ export default function App() {
       </aside>
 
       {/* Main viewport */}
-      <main className="flex-1 bg-studio-dark-bg p-8 overflow-y-auto max-w-7xl mx-auto w-full">
+      <main className="mx-auto w-full min-w-0 max-w-7xl flex-1 overflow-y-auto bg-studio-dark-bg p-4 sm:p-6 lg:p-8">
         {currentTab === 'dashboard' && (
           <ProjectDashboard
             projects={projects}

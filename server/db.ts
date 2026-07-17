@@ -398,11 +398,17 @@ export const initialDB: DBStructure = {
   ]
 };
 
+function cloneDatabase(value: DBStructure): DBStructure {
+  return JSON.parse(JSON.stringify(value)) as DBStructure;
+}
+
 export class LocalDatabase {
   private db: DBStructure;
+  private lastPersisted: DBStructure;
 
   constructor() {
-    this.db = initialDB;
+    this.db = cloneDatabase(initialDB);
+    this.lastPersisted = cloneDatabase(this.db);
     this.ensureDatabaseExists();
   }
 
@@ -414,6 +420,7 @@ export class LocalDatabase {
       if (fs.existsSync(DB_PATH)) {
         const fileContent = fs.readFileSync(DB_PATH, 'utf-8');
         this.db = JSON.parse(fileContent);
+        this.lastPersisted = cloneDatabase(this.db);
       } else {
         this.save();
       }
@@ -423,10 +430,15 @@ export class LocalDatabase {
   }
 
   private save() {
+    const temporaryPath = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
     try {
-      fs.writeFileSync(DB_PATH, JSON.stringify(this.db, null, 2), 'utf-8');
+      fs.writeFileSync(temporaryPath, JSON.stringify(this.db, null, 2), 'utf-8');
+      fs.renameSync(temporaryPath, DB_PATH);
+      this.lastPersisted = cloneDatabase(this.db);
     } catch (e) {
-      console.error('Error saving database file:', e);
+      if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+      this.db = cloneDatabase(this.lastPersisted);
+      throw new Error('Failed to persist the local production database.', { cause: e });
     }
   }
 
@@ -475,8 +487,6 @@ export class LocalDatabase {
         glossary: '',
         unstructuredNotes: ''
       };
-      this.db.bibles.push(bible);
-      this.save();
     }
     return bible;
   }
@@ -649,8 +659,6 @@ export class LocalDatabase {
           soundEffects: []
         }
       };
-      this.db.timelines.push(tl);
-      this.save();
     }
     return tl;
   }
@@ -719,11 +727,11 @@ export class LocalDatabase {
 
   // Full export
   getDatabaseState(): DBStructure {
-    return this.db;
+    return cloneDatabase(this.db);
   }
 
   importDatabaseState(state: DBStructure) {
-    this.db = { ...initialDB, ...state };
+    this.db = cloneDatabase({ ...initialDB, ...state });
     this.save();
   }
 }
