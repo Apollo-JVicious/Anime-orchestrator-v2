@@ -12,6 +12,7 @@ let httpServer: Server;
 let endpoint: URL;
 let store: IntegrationStore;
 let bearerToken: string;
+let draftBearerToken: string;
 let resetRuntime: () => void;
 
 beforeAll(async () => {
@@ -42,6 +43,12 @@ beforeAll(async () => {
       'prompts:read',
       'generations:read',
     ],
+    projectIds: ['crimson-sword'],
+  }).bearerToken;
+  draftBearerToken = store.createIntegrationToken({
+    name: 'MCP draft continuity test',
+    permission: 'read-write',
+    scopes: ['drafts:write'],
     projectIds: ['crimson-sword'],
   }).bearerToken;
 
@@ -198,6 +205,102 @@ describe('stateless Streamable HTTP MCP endpoint', () => {
       });
     } finally {
       await client.close();
+    }
+  });
+
+  it('reviews an MCP-created scene draft without promoting or changing it', async () => {
+    const writer = new Client(
+      { name: 'anime-orchestrator-draft-writer-vitest', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    const writerTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: {
+        headers: { Authorization: `Bearer ${draftBearerToken}` },
+      },
+    });
+    const reader = new Client(
+      { name: 'anime-orchestrator-draft-reader-vitest', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    const readerTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: {
+        headers: { Authorization: `Bearer ${bearerToken}` },
+      },
+    });
+
+    try {
+      await writer.connect(writerTransport);
+      const created = await writer.callTool({
+        name: 'create_scene_draft',
+        arguments: {
+          projectId: 'crimson-sword',
+          episodeId: '1',
+          title: 'Opening exterior',
+          sceneData: {
+            sceneNumber: '1',
+            charactersPresentIds: ['missing-character'],
+            action: 'An isolated cottage stands under moonlight while wolves encircle it.',
+          },
+          sourceNote: 'Vitest-only storyboard transcription.',
+        },
+      });
+      expect(created.isError).not.toBe(true);
+      const createdResult = created.structuredContent as {
+        result: { entityId: string; version: number };
+      };
+
+      await reader.connect(readerTransport);
+      const reviewed = await reader.callTool({
+        name: 'run_continuity_review',
+        arguments: {
+          projectId: 'crimson-sword',
+          sceneId: createdResult.result.entityId,
+        },
+      });
+
+      expect(reviewed.isError).not.toBe(true);
+      expect(reviewed.structuredContent).toMatchObject({
+        result: {
+          projectId: 'crimson-sword',
+          target: {
+            type: 'scene',
+            id: createdResult.result.entityId,
+          },
+          analyticalMode: 'deterministic-record-review',
+          findings: [{
+            severity: 'critical',
+            code: 'MISSING_CHARACTER',
+            evidence: [{
+              type: 'scene',
+              id: createdResult.result.entityId,
+              field: 'charactersPresentIds',
+              value: 'missing-character',
+            }],
+          }],
+          summary: {
+            critical: 1,
+            warning: 0,
+            info: 0,
+          },
+        },
+      });
+
+      const readBack = await reader.callTool({
+        name: 'get_scene',
+        arguments: { sceneId: createdResult.result.entityId },
+      });
+      expect(readBack.structuredContent).toMatchObject({
+        result: {
+          version: createdResult.result.version,
+          status: 'Draft',
+          scene: {
+            id: createdResult.result.entityId,
+            status: 'Draft',
+          },
+        },
+      });
+    } finally {
+      await Promise.allSettled([writer.close(), reader.close()]);
     }
   });
 });

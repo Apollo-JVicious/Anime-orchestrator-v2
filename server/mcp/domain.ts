@@ -24,6 +24,10 @@ export class McpDomainError extends Error {
 }
 
 type JsonObject = { [key: string]: JsonValue };
+type ContinuitySceneRecord = Pick<
+  Scene,
+  'id' | 'projectId' | 'locationId' | 'charactersPresentIds' | 'costumesUsedIds' | 'propsIds'
+>;
 
 function publicGenerationJob(job: GenerationJobRecord) {
   const { requestedByTokenId: _requestedByTokenId, error, ...publicJob } = clone(job);
@@ -92,6 +96,35 @@ function asObject(value: JsonValue): JsonObject {
     throw new McpDomainError('INVALID_RECORD', 'Expected a JSON object record.');
   }
   return value as JsonObject;
+}
+
+function sceneDraftForContinuity(draft: DraftChangeRecord): ContinuitySceneRecord {
+  const payload = asObject(draft.payload);
+  const optionalString = (field: string) => {
+    const value = payload[field];
+    if (value === undefined || value === null) return '';
+    if (typeof value !== 'string') {
+      throw new McpDomainError('INVALID_RECORD', `Scene draft field ${field} must be a string.`);
+    }
+    return value;
+  };
+  const optionalStringArray = (field: string): string[] => {
+    const value = payload[field];
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) {
+      throw new McpDomainError('INVALID_RECORD', `Scene draft field ${field} must be an array of strings.`);
+    }
+    return value.filter((item): item is string => typeof item === 'string');
+  };
+
+  return {
+    id: draft.entityId,
+    projectId: draft.projectId,
+    locationId: optionalString('locationId'),
+    charactersPresentIds: optionalStringArray('charactersPresentIds'),
+    costumesUsedIds: optionalStringArray('costumesUsedIds'),
+    propsIds: optionalStringArray('propsIds')
+  };
 }
 
 function assertSafePatch(patch: Record<string, unknown>) {
@@ -550,12 +583,16 @@ export class AnimeMcpDomainService {
       suggestedCorrection: string
     ) => findings.push({ severity, code, message, evidence: relatedEvidence, relatedCanonIds, suggestedCorrection });
 
-    let scene: Scene | undefined;
+    let scene: ContinuitySceneRecord | undefined;
     let reviewedTarget: { type: string; id: string };
 
     if (input.sceneId) {
       scene = state.scenes.find(item => item.id === input.sceneId && item.projectId === input.projectId);
-      if (!scene) throw new McpDomainError('NOT_FOUND', `Scene ${input.sceneId} was not found.`, 404);
+      if (!scene) {
+        const draft = this.integrations.getLatestDraftChange(input.projectId, 'scene', input.sceneId);
+        if (!draft) throw new McpDomainError('NOT_FOUND', `Scene ${input.sceneId} was not found.`, 404);
+        scene = sceneDraftForContinuity(draft);
+      }
       reviewedTarget = { type: 'scene', id: input.sceneId };
     } else if (input.storyboardId) {
       const panel = state.storyboardPanels.find(item => item.id === input.storyboardId);
